@@ -2,31 +2,53 @@ package de.kctest.plugins
 
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
-import com.fasterxml.jackson.annotation.JsonProperty
 import io.ktor.http.*
 import io.ktor.serialization.jackson.*
 import io.ktor.server.application.*
 import io.ktor.server.html.*
 import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
+import io.ktor.util.pipeline.*
 import kotlinx.html.*
-import java.time.Instant
+import java.security.MessageDigest
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
 
 fun Application.externalLoginModule() {
+
+    class AuthErrorRedirectException(override val message: String, val redirectUri: String, val state: String) :
+        RuntimeException(message)
+
     data class AuthSession(
         val clientId: String,
         val redirectUri: String,
+        val codeChallenge: String,
         val state: String,
-        val nonce: String
-    )
+        val nonce: String,
+        val tabId: String = UUID.randomUUID().toString(),
+        val authCode: String? = null,
+        val authCodeExpiresAt: Long? = null,
+        val sessionId: String? = null
+    ) {
+        fun matchesCodeChallenge(codeVerifier: String): Boolean {
+            val bytes = codeVerifier.toByteArray(Charsets.US_ASCII)
+            val messageDigest = MessageDigest.getInstance("SHA-256");
+            messageDigest.update(bytes, 0, bytes.size);
+            val digest = messageDigest.digest();
+            val codeChallenge = Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+            return this.codeChallenge == codeChallenge
+        }
+
+
+        val isValid: Boolean get() = System.currentTimeMillis() < (authCodeExpiresAt ?: 0)
+    }
+
 
     data class LoginSession(
         val user: String,
@@ -36,28 +58,9 @@ fun Application.externalLoginModule() {
         val isValid: Boolean get() = System.currentTimeMillis() < expiresAt
     }
 
-    class TokenResponse(
-        @JsonProperty("access_token")
-        val token: String? = null,
-
-        @JsonProperty("expires_in")
-        val expiresIn: Long = 0,
-
-        @JsonProperty("refresh_expires_in")
-        val refreshExpiresIn: Long = 0,
-
-        @JsonProperty("refresh_token")
-        val refreshToken: String? = null,
-
-        @JsonProperty("token_type")
-        val tokenType: String? = null,
-
-        @JsonProperty("id_token")
-        val idToken: String? = null
-    )
 
     val loginSessionMap = ConcurrentHashMap<String, LoginSession>()
-    val authCodeMap = ConcurrentHashMap<String, TokenResponse>()
+    val authCodeMap = ConcurrentHashMap<String, AuthSession>()
     val signSecret = "geheim"
     val issuer = "tk-login"
 
@@ -75,14 +78,33 @@ fun Application.externalLoginModule() {
         jackson()
     }
 
-    fun createAccessToken(audience: String, user: String, timeout: Duration) = JWT.create()
+    install(StatusPages) {
+        exception { call: ApplicationCall, cause: AuthErrorRedirectException ->
+            call.respondRedirect {
+                takeFrom(cause.redirectUri)
+                parameters.append("error", cause.message)
+                parameters.append("state", cause.state)
+            }
+        }
+
+        exception { call: ApplicationCall, cause: IllegalStateException ->
+            call.respond(HttpStatusCode.BadRequest, cause.message ?: "unknown")
+        }
+    }
+
+    fun pruneMaps() {
+        loginSessionMap.values.removeIf { !it.isValid }
+        authCodeMap.values.removeIf { !it.isValid }
+    }
+
+    fun createAccessToken(audience: String, user: String, timeout: Long) = JWT.create()
         .withAudience(audience)
         .withIssuer(issuer)
         .withClaim("username", user)
-        .withExpiresAt(Date(System.currentTimeMillis() + timeout.inWholeMilliseconds))
+        .withExpiresAt(Date(System.currentTimeMillis() + timeout))
         .sign(Algorithm.HMAC256(signSecret))
 
-    fun createIdToken(sid: String, audience: String, user: String, nonce: String, timeout: Duration) = JWT.create()
+    fun createIdToken(sid: String, audience: String, user: String, nonce: String, timeout: Long) = JWT.create()
         .withAudience(audience)
         .withIssuer(issuer)
         .withSubject(user)
@@ -93,28 +115,18 @@ fun Application.externalLoginModule() {
         .withClaim("family_name", "family $user")
         .withClaim("preferred_username", user)
         .withClaim("email", "email@$user")
-        .withExpiresAt(Date(System.currentTimeMillis() + timeout.inWholeMilliseconds))
+        .withExpiresAt(Date(System.currentTimeMillis() + timeout))
         .sign(Algorithm.HMAC256(signSecret))
 
 
-    fun newLoginSession(user: String): LoginSession {
-        val loginSession = LoginSession(user)
-        loginSessionMap[loginSession.id] = loginSession
-
-        loginSessionMap.values.removeIf { !it.isValid}
-
-        return loginSession
-    }
-
     suspend fun ApplicationCall.redirectAuthCodeToClient(authSession: AuthSession, loginSession: LoginSession) {
-        val tokens = TokenResponse(
-            token = createAccessToken(authSession.clientId, loginSession.user, 5.minutes),
-            tokenType = "Bearer",
-            expiresIn = Instant.now().toEpochMilli() + 10.minutes.inWholeMilliseconds,
-            idToken = createIdToken(loginSession.id, authSession.clientId, loginSession.user, authSession.nonce, 60.minutes)
-        )
+
         val code = UUID.randomUUID().toString()
-        authCodeMap[code] = tokens
+        authCodeMap[code] = authSession.copy(
+            authCode = code,
+            authCodeExpiresAt = System.currentTimeMillis() + 1.minutes.inWholeMilliseconds,
+            sessionId = loginSession.id
+        )
 
         respondRedirect {
             takeFrom(authSession.redirectUri)
@@ -124,12 +136,23 @@ fun Application.externalLoginModule() {
     }
 
     routing {
-         get("/auth") {
+        intercept(ApplicationCallPipeline.Call) {
+            pruneMaps()
+        }
+        get("/auth") {
             val clientId = call.parameters.required("client_id")
             val redirectUri = call.parameters.required("redirect_uri")
             val state = call.parameters.required("state")
             val nonce = call.parameters.required("nonce")
-            val authSession = AuthSession(clientId, redirectUri, state, nonce)
+            val codeChallenge = call.parameters.required("code_challenge")
+            val codeChallengeMethod = call.parameters.required("code_challenge_method")
+            val responseType = call.parameters.required("response_type")
+
+            assert(codeChallengeMethod == "S256")
+            assert(responseType == "Code")
+
+
+            val authSession = AuthSession(clientId, redirectUri, codeChallenge, state, nonce)
             val loginSession = call.sessions.get<LoginSession>()
             if (loginSession != null && loginSessionMap.get(loginSession.id)?.isValid ?: false) {
                 this@externalLoginModule.log.info("SSO login")
@@ -160,6 +183,11 @@ fun Application.externalLoginModule() {
                         }
                         div {
                             form(action = "login", method = FormMethod.post) {
+                                input {
+                                    name = "TabId"
+                                    type = InputType.hidden
+                                    value = authSession.tabId
+                                }
                                 select {
                                     name = "user"
                                     option {
@@ -186,20 +214,62 @@ fun Application.externalLoginModule() {
 
         post("/login") {
             val parameters = call.receiveParameters()
+            val tabId = parameters.required("tabId")
             val user = parameters.required("user")
             val authSession = call.sessions.get<AuthSession>() ?: throw IllegalStateException("AuthSession Missing")
+            if (authSession.tabId != tabId) {
+                throw AuthErrorRedirectException("Invalid_tabId", authSession.redirectUri, authSession.state)
+            }
             call.sessions.clear<AuthSession>()
-            val loginSession = newLoginSession(user)
+            val loginSession = LoginSession(user)
+            loginSessionMap[loginSession.id] = loginSession
             call.sessions.set(loginSession)
+
             this@externalLoginModule.log.info("login success ${loginSession.id} ${loginSession.user}")
             call.redirectAuthCodeToClient(authSession, loginSession)
         }
 
         post("/token") {
-            val code = call.receiveParameters().required("code")
-            val tokenResponse = authCodeMap.remove(code) ?: throw IllegalStateException("Code invalid")
+            val parameters = call.receiveParameters()
+            val code = parameters.required("code")
+            val codeVerifier = parameters.required("code_verifier")
+            val authSession = authCodeMap.remove(code) ?: throw IllegalStateException("Code invalid")
+            if (!authSession.isValid) {
+                throw IllegalStateException("Code timeout")
+            }
+            if (!authSession.matchesCodeChallenge(codeVerifier)) {
+                throw IllegalStateException("PKCE failure")
+            }
 
-            call.respond(tokenResponse)
+            val loginSession =
+                loginSessionMap.get(authSession.sessionId) ?: throw IllegalStateException("Session not found")
+            if (!loginSession.isValid) {
+                throw IllegalStateException("Session timeout")
+            }
+
+            val accessExpiresIn = 5.minutes.inWholeMilliseconds
+            val accessToken = createAccessToken(
+                authSession.clientId,
+                loginSession.user,
+                accessExpiresIn
+            )
+            val idToken = createIdToken(
+                loginSession.id,
+                authSession.clientId,
+                loginSession.user,
+                authSession.nonce,
+                60.minutes.inWholeMilliseconds
+            )
+
+            val tokens = mapOf<String, Any>(
+                "access_token" to accessToken,
+                "expires_in" to accessExpiresIn,
+
+                "token_type" to "Bearer",
+                "id_token" to idToken
+            )
+
+            call.respond(tokens)
         }
 
         get("/logout") {
@@ -243,4 +313,4 @@ fun Application.externalLoginModule() {
 
 
 private fun Parameters.required(name: String) =
-    this[name] ?: throw IllegalStateException("Parameter Missing")
+    this[name] ?: throw IllegalStateException("Parameter Missing $name")
