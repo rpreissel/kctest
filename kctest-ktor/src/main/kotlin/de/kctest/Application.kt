@@ -6,6 +6,6 @@ import de.kctest.plugins.*
 
 fun main() {
     embeddedServer(Netty, port = 9090, host = "0.0.0.0") {
-        configureRouting()
+        externalLoginModule()
     }.start(wait = true)
 }

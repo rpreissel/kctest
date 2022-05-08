@@ -17,9 +17,10 @@ import java.time.Instant
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
 
-fun Application.configureRouting() {
+fun Application.externalLoginModule() {
     data class AuthSession(
         val clientId: String,
         val redirectUri: String,
@@ -28,8 +29,12 @@ fun Application.configureRouting() {
     )
 
     data class LoginSession(
-        val user: String
-    )
+        val user: String,
+        val id: String = UUID.randomUUID().toString(),
+        val expiresAt: Long = System.currentTimeMillis() + 1.hours.inWholeMilliseconds
+    ) {
+        val isValid: Boolean get() = System.currentTimeMillis() < expiresAt
+    }
 
     class TokenResponse(
         @JsonProperty("access_token")
@@ -51,16 +56,19 @@ fun Application.configureRouting() {
         val idToken: String? = null
     )
 
-    val codeMap = ConcurrentHashMap<String, TokenResponse>()
+    val loginSessionMap = ConcurrentHashMap<String, LoginSession>()
+    val authCodeMap = ConcurrentHashMap<String, TokenResponse>()
     val signSecret = "geheim"
     val issuer = "tk-login"
 
     install(Sessions) {
         cookie<AuthSession>("auth_session", SessionStorageMemory()) {
             cookie.httpOnly = true
+            cookie.maxAge = 5.minutes
         }
         cookie<LoginSession>("login_session", SessionStorageMemory()) {
             cookie.httpOnly = true
+            cookie.maxAge = 1.hours
         }
     }
     install(ContentNegotiation) {
@@ -74,10 +82,11 @@ fun Application.configureRouting() {
         .withExpiresAt(Date(System.currentTimeMillis() + timeout.inWholeMilliseconds))
         .sign(Algorithm.HMAC256(signSecret))
 
-    fun createIdToken(audience: String, user: String, nonce: String, timeout: Duration) = JWT.create()
+    fun createIdToken(sid: String, audience: String, user: String, nonce: String, timeout: Duration) = JWT.create()
         .withAudience(audience)
         .withIssuer(issuer)
         .withSubject(user)
+        .withClaim("sid", sid)
         .withClaim("nonce", nonce)
         .withClaim("name", "name $user")
         .withClaim("given_name", "given $user")
@@ -88,17 +97,24 @@ fun Application.configureRouting() {
         .sign(Algorithm.HMAC256(signSecret))
 
 
-    suspend fun ApplicationCall.redirectToClient(authSession: AuthSession, user: String) {
-        val result = TokenResponse(
-            token = createAccessToken(authSession.clientId, user, 5.minutes),
+    fun newLoginSession(user: String): LoginSession {
+        val loginSession = LoginSession(user)
+        loginSessionMap[loginSession.id] = loginSession
+
+        loginSessionMap.values.removeIf { !it.isValid}
+
+        return loginSession
+    }
+
+    suspend fun ApplicationCall.redirectAuthCodeToClient(authSession: AuthSession, loginSession: LoginSession) {
+        val tokens = TokenResponse(
+            token = createAccessToken(authSession.clientId, loginSession.user, 5.minutes),
             tokenType = "Bearer",
             expiresIn = Instant.now().toEpochMilli() + 10.minutes.inWholeMilliseconds,
-            idToken = createIdToken(authSession.clientId, user, authSession.nonce, 60.minutes)
+            idToken = createIdToken(loginSession.id, authSession.clientId, loginSession.user, authSession.nonce, 60.minutes)
         )
         val code = UUID.randomUUID().toString()
-        codeMap[code] = result
-
-        sessions.set(LoginSession(user))
+        authCodeMap[code] = tokens
 
         respondRedirect {
             takeFrom(authSession.redirectUri)
@@ -107,22 +123,17 @@ fun Application.configureRouting() {
         }
     }
 
-    // Starting point for a Ktor app:
     routing {
-        get("/") {
-            call.respondText("Hello World!")
-        }
-
-        get("/auth") {
+         get("/auth") {
             val clientId = call.parameters.required("client_id")
             val redirectUri = call.parameters.required("redirect_uri")
             val state = call.parameters.required("state")
             val nonce = call.parameters.required("nonce")
             val authSession = AuthSession(clientId, redirectUri, state, nonce)
             val loginSession = call.sessions.get<LoginSession>()
-            if (loginSession != null) {
-                this@configureRouting.log.info("SSO login")
-                call.redirectToClient(authSession, loginSession.user)
+            if (loginSession != null && loginSessionMap.get(loginSession.id)?.isValid ?: false) {
+                this@externalLoginModule.log.info("SSO login")
+                call.redirectAuthCodeToClient(authSession, loginSession)
             } else {
                 call.sessions.set(authSession)
                 call.respondHtml {
@@ -178,29 +189,39 @@ fun Application.configureRouting() {
             val user = parameters.required("user")
             val authSession = call.sessions.get<AuthSession>() ?: throw IllegalStateException("AuthSession Missing")
             call.sessions.clear<AuthSession>()
-            this@configureRouting.log.info("login success")
-            call.redirectToClient(authSession, user)
+            val loginSession = newLoginSession(user)
+            call.sessions.set(loginSession)
+            this@externalLoginModule.log.info("login success ${loginSession.id} ${loginSession.user}")
+            call.redirectAuthCodeToClient(authSession, loginSession)
         }
 
         post("/token") {
             val code = call.receiveParameters().required("code")
-            val tokenResponse = codeMap.remove(code) ?: throw IllegalStateException("Code invalid")
+            val tokenResponse = authCodeMap.remove(code) ?: throw IllegalStateException("Code invalid")
 
             call.respond(tokenResponse)
         }
 
         get("/logout") {
             val idTokenHint = call.parameters.required("id_token_hint")
+            val decodedIdToken = JWT.decode(idTokenHint)
+            val sessionIdFromToken =
+                decodedIdToken.getClaim("sid")?.asString() ?: throw IllegalStateException("sid missing")
             val redirectUri = call.parameters.get("post_logout_redirect_uri")
             val state = call.parameters.required("state")
-            val loginSession = call.sessions.get<LoginSession>()
-            if (loginSession != null) {
-                val decodedIdToken = JWT.decode(idTokenHint)
-                if (decodedIdToken.subject != loginSession.user) {
+            val loginSessionFromCookie = call.sessions.get<LoginSession>()
+            if (loginSessionFromCookie != null) {
+                if (sessionIdFromToken != loginSessionFromCookie.id) {
+                    throw IllegalStateException("Wrong sid")
+                }
+                if (decodedIdToken.subject != loginSessionFromCookie.user) {
                     throw IllegalStateException("Wrong User Id")
                 }
                 call.sessions.clear<LoginSession>()
-                this@configureRouting.log.info("logout")
+            }
+            val loginSessionFromMap = loginSessionMap.remove(sessionIdFromToken)
+            if (loginSessionFromMap != null) {
+                this@externalLoginModule.log.info("logout $sessionIdFromToken ${loginSessionFromMap.user}")
             }
 
             if (redirectUri != null) {
@@ -213,6 +234,8 @@ fun Application.configureRouting() {
             }
 
         }
+
+
     }
 
 
