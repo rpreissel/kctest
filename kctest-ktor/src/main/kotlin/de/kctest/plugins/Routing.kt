@@ -51,20 +51,17 @@ fun Application.configureRouting() {
         val idToken: String? = null
     )
 
-    data class CodeStorage(
-        val user: String,
-        val code: String,
-        val tokens: TokenResponse
-    )
-
-
-    val codeMap = ConcurrentHashMap<String, CodeStorage>()
+    val codeMap = ConcurrentHashMap<String, TokenResponse>()
     val signSecret = "geheim"
     val issuer = "tk-login"
 
     install(Sessions) {
-        cookie<AuthSession>("auth_session", SessionStorageMemory())
-        cookie<LoginSession>("login_session", SessionStorageMemory())
+        cookie<AuthSession>("auth_session", SessionStorageMemory()) {
+            cookie.httpOnly = true
+        }
+        cookie<LoginSession>("login_session", SessionStorageMemory()) {
+            cookie.httpOnly = true
+        }
     }
     install(ContentNegotiation) {
         jackson()
@@ -98,14 +95,14 @@ fun Application.configureRouting() {
             expiresIn = Instant.now().toEpochMilli() + 10.minutes.inWholeMilliseconds,
             idToken = createIdToken(authSession.clientId, user, authSession.nonce, 60.minutes)
         )
-        val codeStorage = CodeStorage(user, UUID.randomUUID().toString(), result)
-        codeMap[codeStorage.code] = codeStorage
+        val code = UUID.randomUUID().toString()
+        codeMap[code] = result
 
         sessions.set(LoginSession(user))
 
         respondRedirect {
             takeFrom(authSession.redirectUri)
-            parameters.append("code", codeStorage.code)
+            parameters.append("code", code)
             parameters.append("state", authSession.state)
         }
     }
@@ -123,8 +120,9 @@ fun Application.configureRouting() {
             val nonce = call.parameters.required("nonce")
             val authSession = AuthSession(clientId, redirectUri, state, nonce)
             val loginSession = call.sessions.get<LoginSession>()
-            if(loginSession!= null) {
-                call.redirectToClient(authSession, "test")
+            if (loginSession != null) {
+                this@configureRouting.log.info("SSO login")
+                call.redirectToClient(authSession, loginSession.user)
             } else {
                 call.sessions.set(authSession)
                 call.respondHtml {
@@ -151,6 +149,19 @@ fun Application.configureRouting() {
                         }
                         div {
                             form(action = "login", method = FormMethod.post) {
+                                select {
+                                    name = "user"
+                                    option {
+                                        label = "Max"
+                                        value = "Max"
+                                        selected = true
+                                    }
+
+                                    option {
+                                        label = "Anne"
+                                        value = "Anne"
+                                    }
+                                }
                                 button(type = ButtonType.submit) {
                                     text("Login")
                                 }
@@ -163,24 +174,49 @@ fun Application.configureRouting() {
         }
 
         post("/login") {
+            val parameters = call.receiveParameters()
+            val user = parameters.required("user")
             val authSession = call.sessions.get<AuthSession>() ?: throw IllegalStateException("AuthSession Missing")
-            call.redirectToClient(authSession, "test")
+            call.sessions.clear<AuthSession>()
+            this@configureRouting.log.info("login success")
+            call.redirectToClient(authSession, user)
         }
 
         post("/token") {
             val code = call.receiveParameters().required("code")
-            val codeStorage = codeMap.remove(code) ?: throw IllegalStateException("Code invalid")
+            val tokenResponse = codeMap.remove(code) ?: throw IllegalStateException("Code invalid")
 
-            call.respond(codeStorage.tokens)
+            call.respond(tokenResponse)
         }
 
+        get("/logout") {
+            val idTokenHint = call.parameters.required("id_token_hint")
+            val redirectUri = call.parameters.get("post_logout_redirect_uri")
+            val state = call.parameters.required("state")
+            val loginSession = call.sessions.get<LoginSession>()
+            if (loginSession != null) {
+                val decodedIdToken = JWT.decode(idTokenHint)
+                if (decodedIdToken.subject != loginSession.user) {
+                    throw IllegalStateException("Wrong User Id")
+                }
+                call.sessions.clear<LoginSession>()
+                this@configureRouting.log.info("logout")
+            }
 
+            if (redirectUri != null) {
+                call.respondRedirect {
+                    takeFrom(redirectUri)
+                    parameters.append("state", state)
+                }
+            } else {
+                call.respond(HttpStatusCode.OK)
+            }
+
+        }
     }
 
 
-
 }
-
 
 
 private fun Parameters.required(name: String) =
