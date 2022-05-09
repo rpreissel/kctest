@@ -2,6 +2,7 @@ package de.kctest.plugins
 
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
+import de.kctest.required
 import io.ktor.http.*
 import io.ktor.serialization.jackson.*
 import io.ktor.server.application.*
@@ -64,16 +65,7 @@ fun Application.externalLoginModule() {
     val signSecret = "geheim"
     val issuer = "tk-login"
 
-    install(Sessions) {
-        cookie<AuthSession>("auth_session", SessionStorageMemory()) {
-            cookie.httpOnly = true
-            cookie.maxAge = 5.minutes
-        }
-        cookie<LoginSession>("login_session", SessionStorageMemory()) {
-            cookie.httpOnly = true
-            cookie.maxAge = 1.hours
-        }
-    }
+
     install(ContentNegotiation) {
         jackson()
     }
@@ -136,181 +128,189 @@ fun Application.externalLoginModule() {
     }
 
     routing {
-        intercept(ApplicationCallPipeline.Call) {
-            pruneMaps()
-        }
-        get("/auth") {
-            val clientId = call.parameters.required("client_id")
-            val redirectUri = call.parameters.required("redirect_uri")
-            val state = call.parameters.required("state")
-            val nonce = call.parameters.required("nonce")
-            val codeChallenge = call.parameters.required("code_challenge")
-            val codeChallengeMethod = call.parameters.required("code_challenge_method")
-            val responseType = call.parameters.required("response_type")
+        route("tk") {
 
-            assert(codeChallengeMethod == "S256")
-            assert(responseType == "Code")
+            install(Sessions) {
+                cookie<AuthSession>("auth_session", SessionStorageMemory()) {
+                    cookie.httpOnly = true
+                    cookie.maxAge = 5.minutes
+                }
+                cookie<LoginSession>("login_session", SessionStorageMemory()) {
+                    cookie.httpOnly = true
+                    cookie.maxAge = 1.hours
+                }
+            }
+            intercept(ApplicationCallPipeline.Call) {
+                pruneMaps()
+            }
+            get("/auth") {
+                val clientId = call.parameters.required("client_id")
+                val redirectUri = call.parameters.required("redirect_uri")
+                val state = call.parameters.required("state")
+                val nonce = call.parameters.required("nonce")
+                val codeChallenge = call.parameters.required("code_challenge")
+                val codeChallengeMethod = call.parameters.required("code_challenge_method")
+                val responseType = call.parameters.required("response_type")
+
+                assert(codeChallengeMethod == "S256")
+                assert(responseType == "Code")
 
 
-            val authSession = AuthSession(clientId, redirectUri, codeChallenge, state, nonce)
-            val loginSession = call.sessions.get<LoginSession>()
-            if (loginSession != null && loginSessionMap.get(loginSession.id)?.isValid ?: false) {
-                this@externalLoginModule.log.info("SSO login")
-                call.redirectAuthCodeToClient(authSession, loginSession)
-            } else {
-                call.sessions.set(authSession)
-                call.respondHtml {
-                    body {
-                        h1 {
-                            text("TK Login")
-                        }
-
-                        h2 {
-                            text("Parameter")
-                        }
-                        div {
-                            p {
-                                text("Redirect-Uri: $redirectUri")
+                val authSession = AuthSession(clientId, redirectUri, codeChallenge, state, nonce)
+                val loginSession = call.sessions.get<LoginSession>()
+                if (loginSession != null && loginSessionMap.get(loginSession.id)?.isValid ?: false) {
+                    this@externalLoginModule.log.info("SSO login")
+                    call.redirectAuthCodeToClient(authSession, loginSession)
+                } else {
+                    call.sessions.set(authSession)
+                    call.respondHtml {
+                        body {
+                            h1 {
+                                text("TK Login")
                             }
 
-                            p {
-                                text("state: $state")
+                            h2 {
+                                text("Parameter")
                             }
-                        }
-
-                        h2 {
-                            text("Login")
-                        }
-                        div {
-                            form(action = "login", method = FormMethod.post) {
-                                input {
-                                    name = "TabId"
-                                    type = InputType.hidden
-                                    value = authSession.tabId
+                            div {
+                                p {
+                                    text("Redirect-Uri: $redirectUri")
                                 }
-                                select {
-                                    name = "user"
-                                    option {
-                                        label = "Max"
-                                        value = "Max"
-                                        selected = true
-                                    }
 
-                                    option {
-                                        label = "Anne"
-                                        value = "Anne"
-                                    }
+                                p {
+                                    text("state: $state")
                                 }
-                                button(type = ButtonType.submit) {
-                                    text("Login")
+                            }
+
+                            h2 {
+                                text("Login")
+                            }
+                            div {
+                                form(action = "login", method = FormMethod.post) {
+                                    input {
+                                        name = "TabId"
+                                        type = InputType.hidden
+                                        value = authSession.tabId
+                                    }
+                                    select {
+                                        name = "user"
+                                        option {
+                                            label = "Max"
+                                            value = "Max"
+                                            selected = true
+                                        }
+
+                                        option {
+                                            label = "Anne"
+                                            value = "Anne"
+                                        }
+                                    }
+                                    button(type = ButtonType.submit) {
+                                        text("Login")
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
             }
 
-        }
-
-        post("/login") {
-            val parameters = call.receiveParameters()
-            val tabId = parameters.required("tabId")
-            val user = parameters.required("user")
-            val authSession = call.sessions.get<AuthSession>() ?: throw IllegalStateException("AuthSession Missing")
-            if (authSession.tabId != tabId) {
-                throw AuthErrorRedirectException("Invalid_tabId", authSession.redirectUri, authSession.state)
-            }
-            call.sessions.clear<AuthSession>()
-            val loginSession = LoginSession(user)
-            loginSessionMap[loginSession.id] = loginSession
-            call.sessions.set(loginSession)
-
-            this@externalLoginModule.log.info("login success ${loginSession.id} ${loginSession.user}")
-            call.redirectAuthCodeToClient(authSession, loginSession)
-        }
-
-        post("/token") {
-            val parameters = call.receiveParameters()
-            val code = parameters.required("code")
-            val codeVerifier = parameters.required("code_verifier")
-            val authSession = authCodeMap.remove(code) ?: throw IllegalStateException("Code invalid")
-            if (!authSession.isValid) {
-                throw IllegalStateException("Code timeout")
-            }
-            if (!authSession.matchesCodeChallenge(codeVerifier)) {
-                throw IllegalStateException("PKCE failure")
-            }
-
-            val loginSession =
-                loginSessionMap.get(authSession.sessionId) ?: throw IllegalStateException("Session not found")
-            if (!loginSession.isValid) {
-                throw IllegalStateException("Session timeout")
-            }
-
-            val accessExpiresIn = 5.minutes.inWholeMilliseconds
-            val accessToken = createAccessToken(
-                authSession.clientId,
-                loginSession.user,
-                accessExpiresIn
-            )
-            val idToken = createIdToken(
-                loginSession.id,
-                authSession.clientId,
-                loginSession.user,
-                authSession.nonce,
-                60.minutes.inWholeMilliseconds
-            )
-
-            val tokens = mapOf<String, Any>(
-                "access_token" to accessToken,
-                "expires_in" to accessExpiresIn,
-
-                "token_type" to "Bearer",
-                "id_token" to idToken
-            )
-
-            call.respond(tokens)
-        }
-
-        get("/logout") {
-            val idTokenHint = call.parameters.required("id_token_hint")
-            val decodedIdToken = JWT.decode(idTokenHint)
-            val sessionIdFromToken =
-                decodedIdToken.getClaim("sid")?.asString() ?: throw IllegalStateException("sid missing")
-            val redirectUri = call.parameters.get("post_logout_redirect_uri")
-            val state = call.parameters.required("state")
-            val loginSessionFromCookie = call.sessions.get<LoginSession>()
-            if (loginSessionFromCookie != null) {
-                if (sessionIdFromToken != loginSessionFromCookie.id) {
-                    throw IllegalStateException("Wrong sid")
+            post("/login") {
+                val parameters = call.receiveParameters()
+                val tabId = parameters.required("tabId")
+                val user = parameters.required("user")
+                val authSession = call.sessions.get<AuthSession>() ?: throw IllegalStateException("AuthSession Missing")
+                if (authSession.tabId != tabId) {
+                    throw AuthErrorRedirectException("Invalid_tabId", authSession.redirectUri, authSession.state)
                 }
-                if (decodedIdToken.subject != loginSessionFromCookie.user) {
-                    throw IllegalStateException("Wrong User Id")
-                }
-                call.sessions.clear<LoginSession>()
-            }
-            val loginSessionFromMap = loginSessionMap.remove(sessionIdFromToken)
-            if (loginSessionFromMap != null) {
-                this@externalLoginModule.log.info("logout $sessionIdFromToken ${loginSessionFromMap.user}")
+                call.sessions.clear<AuthSession>()
+                val loginSession = LoginSession(user)
+                loginSessionMap[loginSession.id] = loginSession
+                call.sessions.set(loginSession)
+
+                this@externalLoginModule.log.info("login success ${loginSession.id} ${loginSession.user}")
+                call.redirectAuthCodeToClient(authSession, loginSession)
             }
 
-            if (redirectUri != null) {
-                call.respondRedirect {
-                    takeFrom(redirectUri)
-                    parameters.append("state", state)
+            post("/token") {
+                val parameters = call.receiveParameters()
+                val code = parameters.required("code")
+                val codeVerifier = parameters.required("code_verifier")
+                val authSession = authCodeMap.remove(code) ?: throw IllegalStateException("Code invalid")
+                if (!authSession.isValid) {
+                    throw IllegalStateException("Code timeout")
                 }
-            } else {
-                call.respond(HttpStatusCode.OK)
+                if (!authSession.matchesCodeChallenge(codeVerifier)) {
+                    throw IllegalStateException("PKCE failure")
+                }
+
+                val loginSession =
+                    loginSessionMap.get(authSession.sessionId) ?: throw IllegalStateException("Session not found")
+                if (!loginSession.isValid) {
+                    throw IllegalStateException("Session timeout")
+                }
+
+                val accessExpiresIn = 5.minutes.inWholeMilliseconds
+                val accessToken = createAccessToken(
+                    authSession.clientId,
+                    loginSession.user,
+                    accessExpiresIn
+                )
+                val idToken = createIdToken(
+                    loginSession.id,
+                    authSession.clientId,
+                    loginSession.user,
+                    authSession.nonce,
+                    60.minutes.inWholeMilliseconds
+                )
+
+                val tokens = mapOf<String, Any>(
+                    "access_token" to accessToken,
+                    "expires_in" to accessExpiresIn,
+
+                    "token_type" to "Bearer",
+                    "id_token" to idToken
+                )
+
+                call.respond(tokens)
             }
+
+            get("/logout") {
+                val idTokenHint = call.parameters.required("id_token_hint")
+                val decodedIdToken = JWT.decode(idTokenHint)
+                val sessionIdFromToken =
+                    decodedIdToken.getClaim("sid")?.asString() ?: throw IllegalStateException("sid missing")
+                val redirectUri = call.parameters.get("post_logout_redirect_uri")
+                val state = call.parameters.required("state")
+                val loginSessionFromCookie = call.sessions.get<LoginSession>()
+                if (loginSessionFromCookie != null) {
+                    if (sessionIdFromToken != loginSessionFromCookie.id) {
+                        throw IllegalStateException("Wrong sid")
+                    }
+                    if (decodedIdToken.subject != loginSessionFromCookie.user) {
+                        throw IllegalStateException("Wrong User Id")
+                    }
+                    call.sessions.clear<LoginSession>()
+                }
+                val loginSessionFromMap = loginSessionMap.remove(sessionIdFromToken)
+                if (loginSessionFromMap != null) {
+                    this@externalLoginModule.log.info("logout $sessionIdFromToken ${loginSessionFromMap.user}")
+                }
+
+                if (redirectUri != null) {
+                    call.respondRedirect {
+                        takeFrom(redirectUri)
+                        parameters.append("state", state)
+                    }
+                } else {
+                    call.respond(HttpStatusCode.OK)
+                }
+
+            }
+
 
         }
-
-
     }
 
-
 }
-
-
-private fun Parameters.required(name: String) =
-    this[name] ?: throw IllegalStateException("Parameter Missing $name")
