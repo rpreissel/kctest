@@ -12,6 +12,7 @@ import io.ktor.server.sessions.*
 import kotlinx.html.*
 
 fun Application.oAuthClientModule(context: String, name: String, secret: String) {
+    data class UserSession(val name: String, val idToken: String)
 
     authentication {
         oauth("auth-oauth-$context") {
@@ -24,14 +25,14 @@ fun Application.oAuthClientModule(context: String, name: String, secret: String)
                     requestMethod = HttpMethod.Post,
                     clientId = context,
                     clientSecret = secret,
-                    defaultScopes = listOf("openid profile")
+                    defaultScopes = listOf("openid profile"),
                 )
             }
+            skipWhen { call -> call.sessions.get<UserSession>()!=null }
             client = applicationHttpClient
         }
     }
 
-    data class UserSession(val token: String)
 
     routing {
         route(context) {
@@ -40,45 +41,71 @@ fun Application.oAuthClientModule(context: String, name: String, secret: String)
             }
 
             authenticate("auth-oauth-$context") {
-                get("/login") {
-                    // Redirects to 'authorizeUrl' automatically
-                }
+                get {
+                    val userSession: UserSession = call.sessions.get() ?: throw IllegalStateException("Not logged in")
+                    call.respondHtml {
+                        body {
+                            h1 {
+                                text(name)
+                            }
 
-                get("/callback") {
-                    val principal: OAuthAccessTokenResponse.OAuth2 = call.principal() ?: throw IllegalStateException()
-                    val username = JWT.decode(principal.extraParameters["id_token"]).getClaim("preferred_username").asString()
-                    call.sessions.set(UserSession(username))
-                    call.respondRedirect("/$context/hello")
-                }
-            }
-            get {
-                call.respondHtml {
-                    body {
-                        h1 {
-                            text(name)
-                        }
+                            h2 {
+                                text("Login Data")
+                            }
+                            div {
+                                text(userSession.name)
+                            }
+                            div {
+                                form(action = "/$context/close", method = FormMethod.get) {
+                                    button(type = ButtonType.submit) {
+                                        text("Close Client")
+                                    }
+                                }
+                            }
 
-                        h2 {
-                            text("Login")
-                        }
-                        div {
-                            form(action = "/$context/login", method = FormMethod.get) {
-                                button(type = ButtonType.submit) {
-                                    text("Login")
+                            div {
+                                form(action = "/$context/logout", method = FormMethod.get) {
+                                    button(type = ButtonType.submit) {
+                                        text("Logout session")
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            get("/hello") {
-                val userSession: UserSession? = call.sessions.get()
-                if (userSession != null) {
-                    call.respondText("Hello, ${userSession.token}!")
-                } else {
+                get("/callback") {
+                    val principal: OAuthAccessTokenResponse.OAuth2 = call.principal() ?: throw IllegalStateException()
+                    val idToken = principal.extraParameters["id_token"]?:throw IllegalStateException()
+                    val username = JWT.decode(idToken).getClaim("preferred_username").asString()
+                    call.sessions.set(UserSession(username, idToken))
                     call.respondRedirect("/$context")
                 }
+
+                get("/close") {
+                    call.sessions.clear<UserSession>()
+                    call.respondRedirect("/$context/home")
+                }
+
+                get("/logout") {
+                    val userSession: UserSession = call.sessions.get() ?: throw IllegalStateException("Not logged in")
+                    call.sessions.clear<UserSession>()
+
+                    call.respondRedirect {
+                        takeFrom("http://localhost:8080/auth/realms/tk-ext/protocol/openid-connect/logout")
+                        parameters.append("post_logout_redirect_uri", "http://localhost:9090/$context/home")
+                        parameters.append("id_token_hint", userSession.idToken)
+                    }
+                }
+            }
+
+            get("home") {
+                call.respondRedirect("/")
+            }
+
+            get("start") {
+                call.sessions.clear<UserSession>()
+                call.respondRedirect("/$context")
             }
         }
     }
