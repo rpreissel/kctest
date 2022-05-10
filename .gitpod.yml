@@ -1,6 +1,7 @@
 tasks:
   - name: build
-    init: ./gradlew build && sync-done build
+    init: ./gradlew build 
+    command: sync-done build
   - name:  keycloak
     init: gp sync-await build && ./gradlew bootRun
   - name: clients
