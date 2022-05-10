@@ -22,8 +22,8 @@ val applicationHttpClient = HttpClient(CIO) {
 fun main() {
     embeddedServer(Netty, port = 9090, host = "0.0.0.0") {
         externalLoginModule()
-        oAuthClientModule("client1","Client 1", "iJfGmUCHhjOj9FXeLwGizChcqcbhBTAZ")
-        oAuthClientModule("client2","Client 2", "RG85Ok6H35XcM6allFx5rHr31aH6ZWcp")
+        oAuthClientModule("client1","Client 1", "1234")
+        oAuthClientModule("client2","Client 2", "1234")
 
         routing {
             get {

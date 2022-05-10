@@ -18,3 +18,7 @@ dependencyManagement {
 dependencies {
     implementation("com.github.thomasdarimont.embedded-spring-boot-keycloak-server:embedded-keycloak-server-spring-boot-starter:7.0.2")
 }
+
+springBoot {
+    mainClass.set("de.e2.kctest.Main")
+}

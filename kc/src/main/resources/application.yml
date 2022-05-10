@@ -33,10 +33,10 @@ keycloak:
       password: admin
       create-admin-user-enabled: true
       #
-      #    migration:
-      #      importProvider: singleFile
-      #      importLocation: keycloak-realm-config.json
-      # -Dkeycloak.migration.strategy=OVERWRITE_EXISTING
+    migration:
+      importProvider: singleFile
+      importLocation: classpath:realm-export.json
+    #  -Dkeycloak.migration.strategy=OVERWRITE_EXISTING
     # -Dkeycloak.migration.strategy=IGNORE_EXISTING
 #  hostname:
 #    provider: "default"
