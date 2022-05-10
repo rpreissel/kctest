@@ -1,5 +1,5 @@
 tasks:
-  - name:  build
+  - name: build
     init: ./gradlew build
     command: gp sync-done build
   - name:  keycloak
