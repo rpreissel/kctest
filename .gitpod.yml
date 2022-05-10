@@ -1,10 +1,12 @@
 tasks:
   - name: build
-    init: ./gradlew build
-    command: gp sync-done build
+    init: ./gradlew build && sync-done build
   - name:  keycloak
-    init: gp sync-await build
-    command: ./gradlew bootRun
+    init: gp sync-await build && ./gradlew bootRun
   - name: clients
-    init: gp sync-await build
-    command: ./gradlew :kctest-ktor:run
+    init: gp await-port 8080 && ./gradlew :kctest-ktor:run
+ports:
+  - port: 8080
+    onOpen: open-browser
+  - port: 9090
+    onOpen: open-browser
