@@ -1,7 +1,10 @@
 tasks:
-  - name:  keycloak
+  - name:  build
     init: ./gradlew build
-    command: ./gradlew bootRun && gp sync-done kc
+    command: gp sync-done build
+  - name:  keycloak
+    init: gp sync-await build
+    command: ./gradlew bootRun
   - name: clients
-    init: gp sync-await bundle
+    init: gp sync-await build
     command: ./gradlew :kctest-ktor:run
