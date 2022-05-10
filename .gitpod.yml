@@ -6,6 +6,10 @@ tasks:
     command: gp sync-await build && ./gradlew bootRun
   - name: clients
     command: gp await-port 8080 && ./gradlew :kctest-ktor:run
+    openMode: split-right
+  - name: keycloak browser
+    command: gp await-port 8080 && gp open $(gp url 8080)auth
+    openMode: tab-before
 ports:
   - port: 9090
     onOpen: open-browser
